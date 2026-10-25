@@ -1,0 +1,194 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Deploy an EXISTING image tag (a previous commit SHA) = rollback. Leave empty to build and deploy this commit."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write # keyless auth to Google Cloud (Workload Identity Federation); no stored keys
+
+env:
+  NODE_VERSION: "22"
+  # Repository variables (Settings > Secrets and variables > Actions > Variables). None of them is a secret.
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION || 'asia-south1' }}
+
+jobs:
+  test-services:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [auth-service, game-service, stats-service]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+      - run: npm ci
+      - name: Unit and integration tests
+        run: npm test
+        env:
+          # stats-service: Redis Streams tests. game-service: the two/three-replica ownership, forwarding,
+          # fencing, recovery and VM-kill tests run against this Redis.
+          REDIS_URL: redis://localhost:6379
+      - name: Dependency audit (high severity and above)
+        run: npm audit --omit=dev --audit-level=high
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  terraform-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infra/terraform
+      - name: terraform validate (no backend, no credentials needed)
+        run: |
+          for layer in base environment; do
+            terraform -chdir=infra/terraform/$layer init -backend=false -input=false
+            terraform -chdir=infra/terraform/$layer validate
+          done
+      - name: shell scripts
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -S warning infra/terraform/scripts/*.sh infra/gcp/vm-startup.sh
+
+  # Plan against the real project on pull requests (only when the repository is configured for GCP).
+  terraform-plan:
+    if: github.event_name == 'pull_request' && vars.GCP_DEPLOY_ENABLED == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: terraform-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: plan (environment layer)
+        run: |
+          terraform -chdir=infra/terraform/environment init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=wordroyale/environment"
+          terraform -chdir=infra/terraform/environment plan -input=false -lock=false \
+            -var "project_id=$GCP_PROJECT_ID" -var "region=$GCP_REGION" -var "state_bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -var "image_tag=${{ github.event.pull_request.head.sha }}"
+
+  # One immutable image per microservice, tagged with the commit SHA, scanned, then pushed to Artifact Registry.
+  build-and-push:
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.image_tag == '')
+    needs: [test-services, test-frontend, terraform-checks]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: auth-service,  context: services/auth-service }
+          - { name: game-service,  context: services/game-service }
+          - { name: stats-service, context: services/stats-service }
+          - { name: frontend,      context: frontend }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          load: true
+          tags: scan/${{ matrix.name }}:ci
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Security scan (Trivy) - fail on HIGH/CRITICAL with a fix available
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: scan/${{ matrix.name }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - uses: google-github-actions/auth@v2
+        if: vars.GCP_DEPLOY_ENABLED == 'true'
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+        if: vars.GCP_DEPLOY_ENABLED == 'true'
+      - name: Push to Artifact Registry (immutable SHA tag)
+        if: vars.GCP_DEPLOY_ENABLED == 'true'
+        run: |
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/wordroyale/wordroyale-${{ matrix.name }}:${{ github.sha }}"
+          docker tag scan/${{ matrix.name }}:ci "$IMAGE"
+          docker push "$IMAGE"
+          echo "pushed $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+  # Rolling release: Terraform builds a NEW instance template with the new image references and the managed instance
+  # group replaces VMs one zone-set at a time (surge, never below capacity). No SSH, no stored keys, no all-at-once restart.
+  # Rollback = run this workflow manually with image_tag = an earlier commit SHA (see docs/deployment-gcp.md).
+  deploy:
+    if: always() && vars.GCP_DEPLOY_ENABLED == 'true' && (needs.build-and-push.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.image_tag != ''))
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: { group: deploy, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Resolve image tag
+        run: echo "IMAGE_TAG=${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}" >> "$GITHUB_ENV"
+      - name: Apply (new instance template + rolling update)
+        run: |
+          terraform -chdir=infra/terraform/environment init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=wordroyale/environment"
+          terraform -chdir=infra/terraform/environment apply -input=false -auto-approve \
+            -var "project_id=$GCP_PROJECT_ID" -var "region=$GCP_REGION" -var "state_bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -var "image_tag=$IMAGE_TAG"
+      - name: Wait for the rollout to be stable
+        run: |
+          MIG=$(terraform -chdir=infra/terraform/environment output -raw mig_name)
+          gcloud compute instance-groups managed wait-until "$MIG" --stable --region "$GCP_REGION" --project "$GCP_PROJECT_ID" --timeout=1200
+          echo "rolled out $IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"

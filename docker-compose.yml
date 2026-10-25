@@ -1,0 +1,146 @@
+# wordRoyale — microservices on a single VM.
+#   docker compose up -d --build     (build from source)
+#   docker compose pull && docker compose up -d     (use images built by CI/CD)
+# Two game-service replicas + load balancer: see compose.local-cloud.yml.
+# Only the gateway (80) is public. Grafana is on 3001; Prometheus only on localhost:9090.
+
+name: wordroyale
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [backend]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  gateway:
+    <<: *service-defaults
+    image: nginx:1.27-alpine
+    ports: ["80:80"]
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend: { condition: service_healthy }
+      auth-service: { condition: service_healthy }
+      game-service: { condition: service_healthy }
+      stats-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/gateway/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-frontend:${TAG:-latest}
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ""        # same origin: the gateway routes /api and /socket.io
+        NEXT_PUBLIC_SOCKET_URL: ""
+        NEXT_PUBLIC_MOCK: "false"
+
+  auth-service:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-auth-service:${TAG:-latest}
+    build: ./services/auth-service
+    environment:
+      PORT: 4001
+      INSTANCE_ID: auth-service
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      DATABASE_URL: postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/auth_db
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  game-service:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-game-service:${TAG:-latest}
+    build: ./services/game-service
+    environment:
+      PORT: 4002
+      INSTANCE_ID: game-service
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      # Data endpoints come from the environment (managed Memorystore / Cloud SQL in the cloud); these are the local defaults.
+      REDIS_URL: ${GAME_REDIS_URL:-redis://redis:6379}
+      DATABASE_URL: ${GAME_DATABASE_URL:-postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD}@postgres:5432/game_db}
+      ROUND_DURATIONS_MS: ${ROUND_DURATIONS_MS:-45000,60000,20000}
+      INTERMISSION_MS: ${INTERMISSION_MS:-7000}
+      RECONNECT_GRACE_MS: ${RECONNECT_GRACE_MS:-30000}
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  stats-service:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-stats-service:${TAG:-latest}
+    build: ./services/stats-service
+    environment:
+      PORT: 4003
+      INSTANCE_ID: stats-service
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      DATABASE_URL: postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD}@postgres:5432/stats_db
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wordroyale}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wordroyale} -d auth_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]   # keep queued game events across restarts
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:11.3.0
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+
+networks:
+  backend:
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

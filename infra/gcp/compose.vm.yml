@@ -1,0 +1,56 @@
+# One VM = the four microservice containers (one image per service, identical on every VM) + a local nginx that
+# exposes a single port (80) to the external load balancer. Data lives in Cloud SQL / Memorystore, never on this VM.
+name: wordroyale
+x-svc: &svc
+  restart: unless-stopped
+  networks: [app]
+  logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+  stop_grace_period: 20s
+
+services:
+  proxy:
+    <<: *svc
+    image: nginx:1.27-alpine
+    ports: ["80:80"]
+    volumes: ["./nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [frontend, auth-service, game-service, stats-service]
+
+  frontend:
+    <<: *svc
+    image: ${IMAGE_FRONTEND}
+
+  auth-service:
+    <<: *svc
+    image: ${IMAGE_AUTH}
+    ports: ["127.0.0.1:4001:4001"]      # loopback only: scraped by the Ops Agent
+    environment: { PORT: 4001, INSTANCE_ID: "${INSTANCE_ID}", JWT_SECRET_FILE: /run/secrets/jwt_secret, DATABASE_URL_FILE: /run/secrets/auth_database_url }
+    volumes: ["${SECRETS_DIR}:/run/secrets:ro"]
+
+  game-service:
+    <<: *svc
+    image: ${IMAGE_GAME}
+    ports: ["127.0.0.1:4002:4002"]
+    stop_grace_period: 30s              # SIGTERM: snapshot rooms, release leases, close sockets
+    environment:
+      PORT: 4002
+      INSTANCE_ID: "${INSTANCE_ID}"
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      REDIS_URL_FILE: /run/secrets/redis_url
+      DATABASE_URL_FILE: /run/secrets/game_database_url
+    volumes: ["${SECRETS_DIR}:/run/secrets:ro"]
+
+  stats-service:
+    <<: *svc
+    image: ${IMAGE_STATS}
+    ports: ["127.0.0.1:4003:4003"]
+    environment:
+      PORT: 4003
+      INSTANCE_ID: "${INSTANCE_ID}"
+      CONSUMER_NAME: "${INSTANCE_ID}"
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      REDIS_URL_FILE: /run/secrets/redis_url
+      DATABASE_URL_FILE: /run/secrets/stats_database_url
+    volumes: ["${SECRETS_DIR}:/run/secrets:ro"]
+
+networks:
+  app:

@@ -1,0 +1,13 @@
+output "network_id" { value = google_compute_network.vpc.id }
+output "network_self_link" { value = google_compute_network.vpc.self_link }
+output "subnetwork_self_link" { value = google_compute_subnetwork.app.self_link }
+output "sql_private_ip" { value = google_sql_database_instance.pg.private_ip_address }
+output "vm_service_account_email" { value = google_service_account.vm.email }
+output "deployer_service_account_email" { value = google_service_account.deployer.email }
+output "workload_identity_provider" { value = google_iam_workload_identity_pool_provider.github.name }
+output "jwt_secret_id" { value = google_secret_manager_secret.jwt.secret_id }
+output "db_password_secret_id" { value = google_secret_manager_secret.db_password.secret_id }
+output "artifact_registry" { value = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.images.repository_id}" }
+output "notification_channel_id" { value = google_monitoring_notification_channel.email.id }
+output "region" { value = var.region }
+output "zones" { value = var.zones }

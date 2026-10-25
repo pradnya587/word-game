@@ -1,0 +1,4 @@
+project_id   = "your-gcp-project-id"
+state_bucket = "your-gcp-project-id-wordroyale-tfstate"
+image_tag    = "<commit sha pushed by CI>"
+# domain = "play.example.com"   # optional; default is <ip>.sslip.io

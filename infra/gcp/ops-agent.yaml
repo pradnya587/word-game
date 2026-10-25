@@ -1,0 +1,29 @@
+# Cloud Ops Agent: container logs (our services print JSON with `severity` and `message`) and Prometheus metrics
+# from each service's /metrics, so Cloud Monitoring shows every instance and service.
+logging:
+  receivers:
+    docker_containers:
+      type: files
+      include_paths: [/var/lib/docker/containers/*/*-json.log]
+  processors:
+    docker_wrapper:
+      type: parse_json
+      time_key: time
+      time_format: "%Y-%m-%dT%H:%M:%S.%LZ"
+    app_json:
+      type: parse_json
+      field: log
+  service:
+    pipelines:
+      containers:
+        receivers: [docker_containers]
+        processors: [docker_wrapper, app_json]
+metrics:
+  receivers:
+    prom_auth:  { type: prometheus, config: { scrape_configs: [{ job_name: auth-service,  scrape_interval: 15s, metrics_path: /metrics, static_configs: [{ targets: ['127.0.0.1:4001'] }] }] } }
+    prom_game:  { type: prometheus, config: { scrape_configs: [{ job_name: game-service,  scrape_interval: 15s, metrics_path: /metrics, static_configs: [{ targets: ['127.0.0.1:4002'] }] }] } }
+    prom_stats: { type: prometheus, config: { scrape_configs: [{ job_name: stats-service, scrape_interval: 15s, metrics_path: /metrics, static_configs: [{ targets: ['127.0.0.1:4003'] }] }] } }
+  service:
+    pipelines:
+      prometheus:
+        receivers: [prom_auth, prom_game, prom_stats]

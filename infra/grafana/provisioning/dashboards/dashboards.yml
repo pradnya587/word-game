@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: wordRoyale
+    folder: wordRoyale
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

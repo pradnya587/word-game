@@ -1,0 +1,169 @@
+# Reproducible local "mini-cloud": the cloud topology on one machine.
+#   cp .env.example .env   (set JWT_SECRET, POSTGRES_PASSWORD, GRAFANA_ADMIN_PASSWORD)
+#   docker compose -f compose.local-cloud.yml up -d --build
+#   open http://localhost        (a six-player room can span game-a and game-b)
+#   docker compose -f compose.local-cloud.yml logs -f game-a      (logs are isolated per replica)
+#   docker compose -f compose.local-cloud.yml stop game-a         (kill the owner: the room resumes on game-b)
+# Same images as production: one image per microservice, identical across replicas. Gameplay is unchanged.
+
+name: wordroyale-local-cloud
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [backend]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+x-game-service: &game-service
+  <<: *service-defaults
+  image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-game-service:${TAG:-latest}
+  build: ./services/game-service
+  environment: &game-env
+    PORT: 4002
+    JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+    REDIS_URL: redis://redis:6379
+    DATABASE_URL: postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/game_db
+    ROUND_DURATIONS_MS: ${ROUND_DURATIONS_MS:-45000,60000,20000}
+    INTERMISSION_MS: ${INTERMISSION_MS:-7000}
+    RECONNECT_GRACE_MS: ${RECONNECT_GRACE_MS:-30000}
+    AUTO_MIGRATE: "false"            # the game-migrate job below owns migrations
+  depends_on:
+    game-migrate: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+  stop_grace_period: 15s              # SIGTERM -> snapshot rooms + hand leases over, then exit
+
+services:
+  gateway:
+    <<: *service-defaults
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+    volumes:
+      - ./infra/nginx/nginx.local-cloud.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend: { condition: service_healthy }
+      auth-service: { condition: service_healthy }
+      game-a: { condition: service_healthy }
+      game-b: { condition: service_healthy }
+      stats-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/gateway/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-frontend:${TAG:-latest}
+    build:
+      context: ./frontend
+      args: { NEXT_PUBLIC_API_URL: "", NEXT_PUBLIC_SOCKET_URL: "", NEXT_PUBLIC_MOCK: "false" }
+
+  auth-service:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-auth-service:${TAG:-latest}
+    build: ./services/auth-service
+    environment:
+      PORT: 4001
+      INSTANCE_ID: auth-service
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      DATABASE_URL: postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/auth_db
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # one-shot: creates/updates the room_snapshots table, then exits
+  game-migrate:
+    <<: *service-defaults
+    restart: "no"
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-game-service:${TAG:-latest}
+    build: ./services/game-service
+    command: ["node", "src/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/game_db
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  game-a:
+    <<: *game-service
+    environment:
+      <<: *game-env
+      INSTANCE_ID: game-a
+
+  game-b:
+    <<: *game-service
+    environment:
+      <<: *game-env
+      INSTANCE_ID: game-b
+
+  stats-service:
+    <<: *service-defaults
+    image: ${REGISTRY:-ghcr.io/your-github-username}/wordroyale-stats-service:${TAG:-latest}
+    build: ./services/stats-service
+    environment:
+      PORT: 4003
+      INSTANCE_ID: stats-service
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      DATABASE_URL: postgres://${POSTGRES_USER:-wordroyale}:${POSTGRES_PASSWORD}@postgres:5432/stats_db
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wordroyale}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wordroyale} -d game_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v2.55.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./infra/prometheus/prometheus.local-cloud.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:11.3.0
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+
+networks:
+  backend:
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,5 @@
+project_id      = "your-gcp-project-id"
+billing_account = "000000-000000-000000"
+alert_email     = "you@example.com"
+github_repo     = "your-github-user/wordroyale"
+# region / zones default to asia-south1 (a, b)

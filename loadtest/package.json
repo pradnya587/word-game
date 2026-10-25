@@ -1,0 +1,8 @@
+{
+  "name": "wordroyale-loadtest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Simulates many concurrent bot players against the running stack",
+  "scripts": { "start": "node bots.js" },
+  "dependencies": { "socket.io-client": "^4.8.1" }
+}
