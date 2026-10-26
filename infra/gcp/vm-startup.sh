@@ -4,6 +4,8 @@
 # Nothing sensitive is stored in the image, the template or the repository, and no game state is written to disk.
 set -euo pipefail
 exec > >(tee -a /var/log/wordroyale-startup.log) 2>&1
+
+trap 'echo "ERROR: VM startup failed at line $LINENO (exit code $?)" >&2' ERR
 echo "== wordroyale bootstrap $(date -u +%FT%TZ)"
 
 MD=http://metadata.google.internal/computeMetadata/v1
@@ -18,7 +20,7 @@ SECRETS_DIR=/run/wordroyale-secrets          # tmpfs: gone on reboot, never on p
 mkdir -p "$APP_DIR" "$SECRETS_DIR"
 
 # ---- Docker + compose plugin (Debian repo of docker.io is old; use Docker's apt repo) ----
-if ! command -v docker >/dev/null; then
+if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg
@@ -42,18 +44,25 @@ systemctl restart google-cloud-ops-agent
 JWT_SECRET_ID="$(attr secret-jwt)"; DB_PASSWORD_SECRET_ID="$(attr secret-db-password)"
 JWT="$(gcloud secrets versions access latest --secret="$JWT_SECRET_ID")"
 DBPW="$(gcloud secrets versions access latest --secret="$DB_PASSWORD_SECRET_ID")"
+# Percent-encode the password before inserting it into a PostgreSQL URL.
+# Pass via stdin so the original password is not exposed as a command argument.
+DBPW_URL="$(printf '%s' "$DBPW" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""), end="")')"
 SQL_IP="$(attr sql-private-ip)"; REDIS_HOST="$(attr redis-host)"; REDIS_PORT="$(attr redis-port)"
 umask 077
 printf '%s' "$JWT" > "$SECRETS_DIR/jwt_secret"
-printf 'postgres://wordroyale:%s@%s:5432/auth_db'  "$DBPW" "$SQL_IP" > "$SECRETS_DIR/auth_database_url"
-printf 'postgres://wordroyale:%s@%s:5432/stats_db' "$DBPW" "$SQL_IP" > "$SECRETS_DIR/stats_database_url"
-printf 'postgres://wordroyale:%s@%s:5432/game_db'  "$DBPW" "$SQL_IP" > "$SECRETS_DIR/game_database_url"
+printf 'postgres://wordrush:%s@%s:5432/auth_db'  "$DBPW_URL" "$SQL_IP" > "$SECRETS_DIR/auth_database_url"
+printf 'postgres://wordrush:%s@%s:5432/stats_db' "$DBPW_URL" "$SQL_IP" > "$SECRETS_DIR/stats_database_url"
+printf 'postgres://wordrush:%s@%s:5432/game_db'  "$DBPW_URL" "$SQL_IP" > "$SECRETS_DIR/game_database_url"
 printf 'redis://%s:%s' "$REDIS_HOST" "$REDIS_PORT" > "$SECRETS_DIR/redis_url"
-# The containers run as a non-root user, so the files must be readable inside this tmpfs. The VM has no public IP,
-# SSH only via IAP + OS Login, and the files vanish on reboot/delete.
-chmod 0444 "$SECRETS_DIR"/*
-chmod 0755 "$SECRETS_DIR"
-unset JWT DBPW
+# Containers read secrets using their non-root UID. The VM has an ephemeral external IP for outbound downloads.
+# Inbound access remains firewall-controlled, and /run is cleared on reboot.
+# Backend containers run as UID 100, GID 101.
+# Keep secrets private while allowing their container user to read them.
+chown 100:101 "$SECRETS_DIR"
+chmod 0700 "$SECRETS_DIR"
+chown 100:101 "$SECRETS_DIR"/*
+chmod 0400 "$SECRETS_DIR"/*
+unset JWT DBPW DBPW_URL
 
 # ---- Images from Artifact Registry (immutable tags / digests chosen by CI) ----
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet

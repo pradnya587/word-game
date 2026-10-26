@@ -154,7 +154,7 @@ jobs:
         if: vars.GCP_DEPLOY_ENABLED == 'true'
         run: |
           gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
-          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/wordroyale/wordroyale-${{ matrix.name }}:${{ github.sha }}"
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/wordrush/${{ matrix.name }}:${{ github.sha }}"
           docker tag scan/${{ matrix.name }}:ci "$IMAGE"
           docker push "$IMAGE"
           echo "pushed $IMAGE" >> "$GITHUB_STEP_SUMMARY"

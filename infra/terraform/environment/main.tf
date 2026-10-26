@@ -4,7 +4,7 @@ data "terraform_remote_state" "base" {
   backend = "gcs"
   config = {
     bucket = var.state_bucket
-    prefix = "wordroyale/base"
+    prefix = "wordrush/base"
   }
 }
 
@@ -14,21 +14,8 @@ locals {
   registry = local.base.artifact_registry
   services = ["frontend", "auth-service", "game-service", "stats-service"]
   # one immutable image per microservice, identical on every VM (replicas of a service all run the same image)
-  images = { for s in local.services : s => lookup(var.image_overrides, s, "${local.registry}/wordroyale-${s}:${var.image_tag}") }
+  images = { for s in local.services : s => lookup(var.image_overrides, s, "${local.registry}/${s}:${var.image_tag}") }
   domain = var.domain != "" ? var.domain : "${replace(google_compute_global_address.lb.address, ".", "-")}.sslip.io"
-}
-
-# ---------------------------------------------------------------- Memorystore for Redis (private)
-resource "google_redis_instance" "redis" {
-  name               = "${var.name_prefix}-redis"
-  tier               = "BASIC"
-  memory_size_gb     = 1
-  region             = var.region
-  location_id        = local.zones[0]
-  redis_version      = "REDIS_7_0"
-  authorized_network = local.base.network_id
-  connect_mode       = "PRIVATE_SERVICE_ACCESS"
-  labels             = var.labels
 }
 
 # ---------------------------------------------------------------- instance template and multi-zone MIG
@@ -48,7 +35,10 @@ resource "google_compute_instance_template" "app" {
 
   network_interface {
     subnetwork = local.base.subnetwork_self_link
-    # no access_config block => no public IP
+
+    # Ephemeral external IP for outbound package downloads.
+    # Firewall rules still restrict incoming connections.
+    access_config {}
   }
 
   service_account {
@@ -73,8 +63,8 @@ resource "google_compute_instance_template" "app" {
     image-auth-service  = local.images["auth-service"]
     image-game-service  = local.images["game-service"]
     image-stats-service = local.images["stats-service"]
-    redis-host          = google_redis_instance.redis.host
-    redis-port          = tostring(google_redis_instance.redis.port)
+    redis-host          = local.base.redis_host
+    redis-port          = tostring(local.base.redis_port)
     sql-private-ip      = local.base.sql_private_ip
     secret-jwt          = local.base.jwt_secret_id
     secret-db-password  = local.base.db_password_secret_id
@@ -141,7 +131,7 @@ resource "google_compute_region_instance_group_manager" "app" {
     max_unavailable_fixed = 0
   }
 
-  depends_on = [google_redis_instance.redis]
+
 }
 
 resource "google_compute_region_autoscaler" "app" {
@@ -253,7 +243,7 @@ resource "google_monitoring_alert_policy" "unhealthy_instance" {
       duration = "120s"
     }
   }
-  notification_channels = [local.base.notification_channel_id]
+  notification_channels = []
   user_labels           = var.labels
 }
 
@@ -273,7 +263,7 @@ resource "google_monitoring_alert_policy" "high_cpu" {
       }
     }
   }
-  notification_channels = [local.base.notification_channel_id]
+  notification_channels = []
   user_labels           = var.labels
 }
 
@@ -298,7 +288,7 @@ resource "google_monitoring_alert_policy" "error_rate" {
       }
     }
   }
-  notification_channels = [local.base.notification_channel_id]
+  notification_channels = []
   user_labels           = var.labels
 }
 
