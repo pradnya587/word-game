@@ -107,7 +107,7 @@ jobs:
       - name: plan (environment layer)
         run: |
           terraform -chdir=infra/terraform/environment init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=wordroyale/environment"
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=wordrush/environment"
           terraform -chdir=infra/terraform/environment plan -input=false -lock=false \
             -var "project_id=$GCP_PROJECT_ID" -var "region=$GCP_REGION" -var "state_bucket=${{ vars.TF_STATE_BUCKET }}" \
             -var "image_tag=${{ github.event.pull_request.head.sha }}"
@@ -183,7 +183,7 @@ jobs:
       - name: Apply (new instance template + rolling update)
         run: |
           terraform -chdir=infra/terraform/environment init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=wordroyale/environment"
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="prefix=wordrush/environment"
           terraform -chdir=infra/terraform/environment apply -input=false -auto-approve \
             -var "project_id=$GCP_PROJECT_ID" -var "region=$GCP_REGION" -var "state_bucket=${{ vars.TF_STATE_BUCKET }}" \
             -var "image_tag=$IMAGE_TAG"
