@@ -293,8 +293,8 @@ resource "google_billing_budget" "project" {
   }
 
   all_updates_rule {
-    monitoring_notification_channels     = [google_monitoring_notification_channel.email.id]
-    disable_default_iam_recipients = false
+    monitoring_notification_channels = [google_monitoring_notification_channel.email.id]
+    disable_default_iam_recipients   = false
   }
   depends_on = [google_project_service.apis]
 }
