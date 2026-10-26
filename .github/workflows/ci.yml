@@ -76,7 +76,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9.8"
+          terraform_version: "1.17.0"
       - name: terraform fmt
         run: terraform fmt -check -recursive infra/terraform
       - name: terraform validate (no backend, no credentials needed)
@@ -103,7 +103,7 @@ jobs:
           service_account: ${{ vars.GCP_DEPLOYER_SA }}
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9.8"
+          terraform_version: "1.17.0"
       - name: plan (environment layer)
         run: |
           terraform -chdir=infra/terraform/environment init -input=false \
@@ -177,7 +177,7 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9.8"
+          terraform_version: "1.17.0"
       - name: Resolve image tag
         run: echo "IMAGE_TAG=${{ inputs.image_tag != '' && inputs.image_tag || github.sha }}" >> "$GITHUB_ENV"
       - name: Apply (new instance template + rolling update)
