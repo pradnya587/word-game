@@ -1,0 +1,32 @@
+name: Test Artifact Registry Push
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker authentication
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+
+      - name: Build and push test image
+        run: |
+          IMAGE="asia-south1-docker.pkg.dev/wordroyale/wordrush/auth-service:cd-push-test"
+          docker build -t "$IMAGE" services/auth-service
+          docker push "$IMAGE"
+          echo "Successfully pushed $IMAGE"
