@@ -4,6 +4,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
 FROM node:22-alpine
+# The runtime uses node directly; npm is only needed while building.
+RUN rm -rf /usr/local/lib/node_modules/npm     /usr/local/bin/npm     /usr/local/bin/npx
 WORKDIR /app
 ENV NODE_ENV=production PORT=4003
 RUN addgroup -S app && adduser -S app -G app
